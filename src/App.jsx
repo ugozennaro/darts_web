@@ -29,7 +29,13 @@ import {
   Edit2, 
   Save, 
   X,
-  ChevronRight
+  ChevronRight,
+  ChevronDown,
+  RotateCcw,
+  TrendingUp,
+  TrendingDown,
+  Minus,
+  Trash2
 } from 'lucide-react';
 
 // Your web app's Firebase configuration
@@ -90,6 +96,7 @@ const Input = ({ ...props }) => (
 );
 
 // --- Application Principale ---
+// --- Main Application ---
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -97,16 +104,15 @@ export default function App() {
   const [players, setPlayers] = useState([]);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [expandedHistory, setExpandedHistory] = useState(new Set());
 
   // États pour le jeu
   const [gameState, setGameState] = useState({
     active: false,
-    p1: null, // ID
-    p2: null, // ID
-    score1: 501,
-    score2: 501,
-    turn: null, // ID du joueur courant
-    roundScore: ''
+    players: [], // [{ pid, name, score, elo }]
+    turnIndex: 0,
+    roundScore: '',
+    moves: []
   });
 
   // États pour formulaires
@@ -195,15 +201,18 @@ export default function App() {
     }
   };
 
-  const startGame = (p1Id, p2Id) => {
+  const startGame = (selectedPlayerIds) => {
+    const gamePlayers = selectedPlayerIds.map(pid => {
+      const p = players.find(pl => pl.pid === pid);
+      return { pid: p.pid, name: p.name, score: 501, elo: p.elo };
+    });
+
     setGameState({
       active: true,
-      p1: p1Id,
-      p2: p2Id,
-      score1: 501,
-      score2: 501,
-      turn: p1Id,
-      roundScore: ''
+      players: gamePlayers,
+      turnIndex: 0,
+      roundScore: '',
+      moves: []
     });
     setView('game');
   };
@@ -215,159 +224,300 @@ export default function App() {
       return;
     }
 
-    const isP1 = gameState.turn === gameState.p1;
-    const currentScore = isP1 ? gameState.score1 : gameState.score2;
+    const currentPlayerIndex = gameState.turnIndex;
+    const currentPlayer = gameState.players[currentPlayerIndex];
+    const currentScore = currentPlayer.score;
     const newScore = currentScore - points;
     
-    let nextTurn = isP1 ? gameState.p2 : gameState.p1;
-    let nextScore1 = isP1 ? newScore : gameState.score1;
-    let nextScore2 = isP1 ? gameState.score2 : newScore;
+    let finalScore = newScore;
     let winner = null;
+    let isBust = false;
 
     // Logique 501
     if (newScore === 0) {
       winner = gameState.turn;
     } else if (newScore < 0 || newScore === 1) {
       // Bust
+      isBust = true;
       // Le score ne change pas, on passe juste le tour
-      nextScore1 = gameState.score1;
-      nextScore2 = gameState.score2;
+      finalScore = currentScore;
     } else {
       // Score valide, rien de spécial
     }
 
+    // Mise à jour des joueurs
+    const newPlayers = [...gameState.players];
+    newPlayers[currentPlayerIndex] = { ...currentPlayer, score: finalScore };
+
+    // Enregistrement du coup
+    const newMove = {
+      playerId: currentPlayer.pid,
+      points: points,
+      remaining: finalScore,
+      isBust: isBust,
+      timestamp: Date.now()
+    };
+    const updatedMoves = [...(gameState.moves || []), newMove];
+
     if (winner) {
-      await recordGame(winner, isP1 ? gameState.p2 : gameState.p1);
+      const loserIds = gameState.players.filter(p => p.pid !== winner).map(p => p.pid);
+      await recordGame(winner, loserIds, updatedMoves);
       setGameState({ ...gameState, active: false });
       setView('dashboard');
     } else {
       setGameState({
         ...gameState,
-        score1: nextScore1,
-        score2: nextScore2,
-        turn: nextTurn,
-        roundScore: ''
+        players: newPlayers,
+        turnIndex: (currentPlayerIndex + 1) % gameState.players.length,
+        roundScore: '',
+        moves: updatedMoves
       });
     }
   };
 
-  const recordGame = async (winnerId, loserId) => {
+  const recordGame = async (winnerId, loserIds, moves = []) => {
     const winner = players.find(p => p.pid === winnerId);
-    const loser = players.find(p => p.pid === loserId);
+    const losers = loserIds.map(id => players.find(p => p.pid === id));
     
-    if (!winner || !loser) return;
+    if (!winner || losers.length === 0) return;
 
-    // Calcul Elo
-    const eloChangeWinner = calculateElo(winner.elo, loser.elo, 1);
-    const eloChangeLoser = calculateElo(loser.elo, winner.elo, 0); // Devrait être l'inverse exact souvent
+    // Calcul Elo Multijoueur (Winner takes all vs each loser)
+    let totalWinnerChange = 0;
+    const loserUpdates = [];
+
+    losers.forEach(loser => {
+      // Le gagnant joue contre ce perdant
+      const change = calculateElo(winner.elo, loser.elo, 1);
+      totalWinnerChange += change;
+
+      // Le perdant joue contre le gagnant
+      const loserChange = calculateElo(loser.elo, winner.elo, 0);
+      loserUpdates.push({ 
+        pid: loser.pid, 
+        change: loserChange,
+        matches: loser.matches + 1
+      });
+    });
 
     try {
       // Transaction pour cohérence
       await runTransaction(db, async (transaction) => {
         const winnerRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', winnerId);
-        const loserRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', loserId);
         const historyRef = doc(collection(db, 'artifacts', appId, 'public', 'data', 'history'));
 
         transaction.update(winnerRef, {
-          elo: winner.elo + eloChangeWinner,
+          elo: winner.elo + totalWinnerChange,
           matches: winner.matches + 1,
           wins: winner.wins + 1
         });
 
-        transaction.update(loserRef, {
-          elo: loser.elo + eloChangeLoser, // eloChangeLoser est négatif normalement
-          matches: loser.matches + 1
+        loserUpdates.forEach(lUpdate => {
+          const lRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', lUpdate.pid);
+          transaction.update(lRef, {
+            elo: (players.find(p => p.pid === lUpdate.pid).elo) + lUpdate.change,
+            matches: lUpdate.matches
+          });
         });
 
+        // Compatibilité : si 1v1, on remplit loserId/loserName comme avant
+        // Sinon on utilise un tableau 'losers'
+        const is1v1 = losers.length === 1;
+        
         transaction.set(historyRef, {
           winnerId,
           winnerName: winner.name,
-          loserId,
-          loserName: loser.name,
-          eloChange: eloChangeWinner,
-          date: serverTimestamp()
+          // Champs legacy pour compatibilité 1v1
+          loserId: is1v1 ? losers[0].pid : null,
+          loserName: is1v1 ? losers[0].name : `${losers.length} joueurs`,
+          
+          // Nouveaux champs
+          losers: losers.map((l, idx) => ({
+            pid: l.pid,
+            name: l.name,
+            eloChange: loserUpdates[idx].change
+          })),
+          eloChange: totalWinnerChange,
+          date: serverTimestamp(),
+          moves: moves
         });
       });
-      alert(`Victoire de ${winner.name} ! (+${eloChangeWinner} Elo)`);
+      alert(`Victoire de ${winner.name} ! (+${totalWinnerChange} Elo)`);
     } catch (e) {
       console.error("Transaction failed: ", e);
       alert("Erreur lors de l'enregistrement du match.");
     }
   };
 
+  const toggleHistory = (id) => {
+    setExpandedHistory(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const undoLastMove = () => {
+    if (!gameState.moves || gameState.moves.length === 0) return;
+
+    const newMoves = [...gameState.moves];
+    const lastMove = newMoves.pop();
+
+    // Retrouver l'index du joueur qui a joué ce coup
+    const playerIndex = gameState.players.findIndex(p => p.pid === lastMove.playerId);
+    if (playerIndex === -1) return;
+
+    const prevScore = lastMove.isBust ? lastMove.remaining : lastMove.remaining + lastMove.points;
+    const newPlayers = [...gameState.players];
+    newPlayers[playerIndex] = { ...newPlayers[playerIndex], score: prevScore };
+
+    setGameState(prev => ({
+      ...prev,
+      players: newPlayers,
+      turnIndex: playerIndex, // On redonne la main à celui qui a joué
+      moves: newMoves,
+      roundScore: ''
+    }));
+  };
+
   // --- Vues ---
 
   const sortedPlayers = useMemo(() => {
-    return [...players].sort((a, b) => b.elo - a.elo);
+    return [...players].sort((a, b) => {
+      if (b.elo !== a.elo) return b.elo - a.elo;
+      return b.matches - a.matches;
+    });
   }, [players]);
 
-  const PlayerItem = ({ p, rank }) => (
-    <div className="flex items-center justify-between p-3 bg-slate-700/50 rounded-lg mb-2">
-      <div className="flex items-center gap-3">
-        <div className={`w-8 h-8 flex items-center justify-center rounded-full font-bold ${rank === 1 ? 'bg-yellow-500 text-black' : rank === 2 ? 'bg-slate-300 text-black' : rank === 3 ? 'bg-amber-600 text-black' : 'bg-slate-600 text-white'}`}>
-          {rank}
-        </div>
-        <div>
-          {editingId === p.pid ? (
-            <div className="flex gap-2">
-              <input 
-                value={editName} 
-                onChange={(e) => setEditName(e.target.value)}
-                className="bg-slate-900 px-2 py-1 rounded text-sm text-white border border-blue-500 outline-none w-32"
-                autoFocus
-              />
-              <button onClick={() => handleUpdateName(p.pid)} className="text-green-400"><Save size={16}/></button>
-              <button onClick={() => setEditingId(null)} className="text-red-400"><X size={16}/></button>
+  const PlayerItem = ({ p, rank }) => {
+    // Recherche compatible avec l'ancien (loserId) et le nouveau (losers array) format
+    const lastMatch = history.find(h => 
+      h.winnerId === p.pid || 
+      h.loserId === p.pid || 
+      (h.losers && h.losers.some(l => l.pid === p.pid))
+    );
+    let TrendIcon = Minus;
+    let trendColor = 'text-slate-600';
+
+    if (lastMatch) {
+      if (lastMatch.winnerId === p.pid) {
+        TrendIcon = TrendingUp;
+        trendColor = 'text-green-500';
+      } else {
+        TrendIcon = TrendingDown;
+        trendColor = 'text-red-500';
+      }
+    }
+
+    return (
+      <div className="flex items-center justify-between p-3 bg-slate-700/50 rounded-lg mb-2">
+        <div className="flex items-center gap-3">
+          <div className={`w-8 h-8 flex items-center justify-center rounded-full font-bold ${rank === 1 ? 'bg-yellow-500 text-black' : rank === 2 ? 'bg-slate-300 text-black' : rank === 3 ? 'bg-amber-600 text-black' : 'bg-slate-600 text-white'}`}>
+            {rank}
+          </div>
+          <div>
+            {editingId === p.pid ? (
+              <div className="flex gap-2">
+                <input 
+                  value={editName} 
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="bg-slate-900 px-2 py-1 rounded text-sm text-white border border-blue-500 outline-none w-32"
+                  autoFocus
+                />
+                <button onClick={() => handleUpdateName(p.pid)} className="text-green-400"><Save size={16}/></button>
+                <button onClick={() => setEditingId(null)} className="text-red-400"><X size={16}/></button>
+              </div>
+            ) : (
+              <div className="font-medium text-white flex items-center gap-2">
+                {p.name} <span className="text-xs text-slate-400 font-mono">[{p.pid}]</span>
+              </div>
+            )}
+            <div className="text-xs text-slate-400">
+              {p.wins}V / {p.matches - p.wins}D ({p.matches > 0 ? Math.round((p.wins/p.matches)*100) : 0}%)
             </div>
-          ) : (
-            <div className="font-medium text-white flex items-center gap-2">
-              {p.name} <span className="text-xs text-slate-400 font-mono">[{p.pid}]</span>
-            </div>
-          )}
-          <div className="text-xs text-slate-400">
-            {p.wins}V / {p.matches - p.wins}D ({p.matches > 0 ? Math.round((p.wins/p.matches)*100) : 0}%)
           </div>
         </div>
-      </div>
-      <div className="flex items-center gap-4">
-        <div className="text-right">
-          <div className="font-bold text-blue-400 text-lg">{p.elo}</div>
-          <div className="text-[10px] text-slate-500 uppercase tracking-wider">ELO</div>
+        <div className="flex items-center gap-4">
+          <div className="text-right">
+            <div className="font-bold text-blue-400 text-lg flex items-center justify-end gap-1">
+              {p.elo}
+              <TrendIcon size={14} className={trendColor} />
+            </div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider">ELO</div>
+          </div>
+          {view === 'players' && !editingId && (
+            <button onClick={() => { setEditingId(p.pid); setEditName(p.name); }} className="text-slate-500 hover:text-white">
+              <Edit2 size={16} />
+            </button>
+          )}
         </div>
-        {view === 'players' && !editingId && (
-          <button onClick={() => { setEditingId(p.pid); setEditName(p.name); }} className="text-slate-500 hover:text-white">
-            <Edit2 size={16} />
-          </button>
-        )}
       </div>
-    </div>
-  );
+    );
+  };
 
   const GameView = () => {
-    const p1 = players.find(p => p.pid === gameState.p1);
-    const p2 = players.find(p => p.pid === gameState.p2);
-    const isP1Turn = gameState.turn === gameState.p1;
+    const currentPlayer = gameState.players[gameState.turnIndex];
 
     // NumPad simple pour mobile
     const addDigit = (d) => setGameState(prev => ({...prev, roundScore: prev.roundScore + d}));
     const clear = () => setGameState(prev => ({...prev, roundScore: ''}));
 
+    useEffect(() => {
+      const handleKeyDown = (e) => {
+        if (e.key >= '0' && e.key <= '9') {
+          addDigit(e.key);
+        } else if (e.key === 'Backspace') {
+          setGameState(prev => ({...prev, roundScore: prev.roundScore.slice(0, -1)}));
+        } else if (e.key === 'Enter') {
+          submitScore();
+        } else if (e.key === 'Escape') {
+          clear();
+        }
+      };
+      window.addEventListener('keydown', handleKeyDown);
+      return () => window.removeEventListener('keydown', handleKeyDown);
+    }, []);
+
     return (
-      <div className="space-y-6 max-w-md mx-auto">
-        <div className="flex justify-between items-center bg-slate-800 p-4 rounded-xl border border-slate-700">
-          <div className={`text-center transition-opacity ${!isP1Turn ? 'opacity-50' : 'opacity-100 scale-105'}`}>
-            <div className="text-sm text-slate-400">{p1?.name}</div>
-            <div className="text-4xl font-bold text-blue-400">{gameState.score1}</div>
-          </div>
-          <div className="text-slate-600 font-mono text-xl">VS</div>
-          <div className={`text-center transition-opacity ${isP1Turn ? 'opacity-50' : 'opacity-100 scale-105'}`}>
-            <div className="text-sm text-slate-400">{p2?.name}</div>
-            <div className="text-4xl font-bold text-red-400">{gameState.score2}</div>
-          </div>
+      <div className="space-y-4 max-w-md mx-auto">
+        {/* Grille des scores */}
+        <div className="grid grid-cols-2 gap-3">
+          {gameState.players.map((p, idx) => {
+            const isTurn = idx === gameState.turnIndex;
+            return (
+              <div key={p.pid} className={`p-3 rounded-xl border transition-all ${isTurn ? 'bg-slate-800 border-blue-500 shadow-lg shadow-blue-900/20 scale-105 z-10' : 'bg-slate-900/50 border-slate-800 opacity-80'}`}>
+                <div className="flex justify-between items-center mb-1">
+                  <span className={`font-bold text-sm truncate ${isTurn ? 'text-white' : 'text-slate-400'}`}>{p.name}</span>
+                  {isTurn && <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>}
+                </div>
+                <div className={`text-3xl font-mono font-bold ${isTurn ? 'text-blue-400' : 'text-slate-500'}`}>
+                  {p.score}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Historique des coups en cours */}
+        <div className="bg-slate-900/50 rounded-lg p-3 max-h-40 overflow-y-auto space-y-1 text-sm border border-slate-800">
+           <div className="text-xs text-slate-500 font-bold uppercase sticky top-0 bg-slate-900/90 backdrop-blur pb-1 mb-2 border-b border-slate-800">Historique de la partie</div>
+           {gameState.moves && gameState.moves.slice().reverse().map((move, idx) => {
+             const pName = players.find(p => p.pid === move.playerId)?.name || move.playerId;
+             return (
+               <div key={idx} className="flex justify-between text-slate-300">
+                 <span className="text-slate-400">{pName}</span>
+                 <span className="font-mono">
+                   {move.points} {move.isBust && <span className="text-red-500 text-xs font-bold">BUST</span>} 
+                   <span className="text-slate-600 mx-2">→</span> 
+                   <span className={move.isBust ? 'text-slate-500' : 'text-white'}>{move.remaining}</span>
+                 </span>
+               </div>
+             );
+           })}
+           {(!gameState.moves || gameState.moves.length === 0) && <div className="text-slate-600 text-center italic text-xs py-2">Aucun coup joué</div>}
         </div>
 
         <div className="text-center">
-           <div className="text-slate-400 mb-2">Au tour de <span className="text-white font-bold">{isP1Turn ? p1?.name : p2?.name}</span></div>
+           <div className="text-slate-400 mb-2">Au tour de <span className="text-white font-bold">{currentPlayer?.name}</span></div>
            <div className="h-16 flex items-center justify-center bg-slate-900 rounded-lg border-2 border-slate-700 text-3xl font-mono tracking-widest text-white mb-4">
              {gameState.roundScore || <span className="text-slate-700">0</span>}
            </div>
@@ -385,41 +535,62 @@ export default function App() {
           <button onClick={submitScore} className="h-14 bg-blue-600 text-white rounded-lg font-bold hover:bg-blue-500 shadow-lg shadow-blue-900/50">OK</button>
         </div>
 
-        <Button variant="ghost" className="w-full mt-4" onClick={() => setView('dashboard')}>
-          Annuler le match
-        </Button>
+        <div className="flex gap-2 mt-4">
+          <Button 
+            variant="secondary" 
+            className="flex-1" 
+            onClick={undoLastMove}
+            disabled={!gameState.moves || gameState.moves.length === 0}
+          >
+            <RotateCcw size={18} /> Annuler coup
+          </Button>
+          <Button variant="ghost" className="flex-1" onClick={() => setView('dashboard')}>
+            Quitter
+          </Button>
+        </div>
       </div>
     );
   };
 
   const PreGameView = () => {
-    const [selP1, setSelP1] = useState('');
-    const [selP2, setSelP2] = useState('');
+    const [selectedIds, setSelectedIds] = useState([]);
+
+    const togglePlayer = (pid) => {
+      if (selectedIds.includes(pid)) {
+        setSelectedIds(selectedIds.filter(id => id !== pid));
+      } else {
+        setSelectedIds([...selectedIds, pid]);
+      }
+    };
 
     return (
       <div className="space-y-6">
         <h2 className="text-2xl font-bold text-white mb-6">Nouveau Match 501</h2>
-        <div className="grid grid-cols-2 gap-4">
+        
+        <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800 max-h-96 overflow-y-auto">
+          <div className="text-sm text-slate-400 mb-3 uppercase font-bold">Sélectionnez les joueurs ({selectedIds.length})</div>
           <div className="space-y-2">
-            <label className="text-sm text-slate-400">Joueur 1</label>
-            <select className="w-full bg-slate-800 p-3 rounded-lg text-white border border-slate-700" onChange={e => setSelP1(e.target.value)} value={selP1}>
-              <option value="">Sélectionner...</option>
-              {sortedPlayers.map(p => <option key={p.pid} value={p.pid}>{p.name}</option>)}
-            </select>
-          </div>
-          <div className="space-y-2">
-             <label className="text-sm text-slate-400">Joueur 2</label>
-            <select className="w-full bg-slate-800 p-3 rounded-lg text-white border border-slate-700" onChange={e => setSelP2(e.target.value)} value={selP2}>
-              <option value="">Sélectionner...</option>
-              {sortedPlayers.filter(p => p.pid !== selP1).map(p => <option key={p.pid} value={p.pid}>{p.name}</option>)}
-            </select>
+            {sortedPlayers.map(p => {
+              const isSelected = selectedIds.includes(p.pid);
+              return (
+                <div 
+                  key={p.pid} 
+                  onClick={() => togglePlayer(p.pid)}
+                  className={`p-3 rounded-lg flex items-center justify-between cursor-pointer transition-all ${isSelected ? 'bg-blue-900/30 border border-blue-500/50' : 'bg-slate-800/50 border border-transparent hover:bg-slate-800'}`}
+                >
+                  <span className={isSelected ? 'text-white font-bold' : 'text-slate-300'}>{p.name}</span>
+                  {isSelected && <div className="w-3 h-3 bg-blue-500 rounded-full shadow-[0_0_10px_rgba(59,130,246,0.8)]"></div>}
+                </div>
+              );
+            })}
           </div>
         </div>
+
         <Button 
           variant="success" 
           className="w-full py-4 text-lg" 
-          disabled={!selP1 || !selP2}
-          onClick={() => startGame(selP1, selP2)}
+          disabled={selectedIds.length < 2}
+          onClick={() => startGame(selectedIds)}
         >
           <Play size={20} fill="currentColor" /> Lancer le match
         </Button>
@@ -543,15 +714,35 @@ export default function App() {
                 </h2>
                 <div className="space-y-2">
                   {history.slice(0, 5).map((h) => (
-                    <div key={h.id} className="bg-slate-800/50 p-3 rounded-lg border border-slate-700/50 flex items-center justify-between text-sm">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-green-400">{h.winnerName}</span>
-                        <span className="text-slate-500 text-xs">bat</span>
-                        <span className="text-red-400">{h.loserName}</span>
+                    <div key={h.id} className="bg-slate-800/50 rounded-lg border border-slate-700/50 overflow-hidden">
+                      <div 
+                        className="p-3 flex items-center justify-between text-sm cursor-pointer hover:bg-slate-800 transition-colors"
+                        onClick={() => toggleHistory(h.id)}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-green-400">{h.winnerName}</span>
+                          <span className="text-slate-500 text-xs">{h.losers && h.losers.length > 1 ? 'vs' : 'bat'}</span>
+                          <span className="text-red-400">{h.loserName}</span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <div className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 font-mono">
+                            +{h.eloChange} Elo
+                          </div>
+                          {h.moves && (expandedHistory.has(h.id) ? <ChevronDown size={14} className="text-slate-500"/> : <ChevronRight size={14} className="text-slate-500"/>)}
+                        </div>
                       </div>
-                      <div className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 font-mono">
-                        +{h.eloChange} Elo
-                      </div>
+                      
+                      {/* Détails de l'historique */}
+                      {expandedHistory.has(h.id) && h.moves && (
+                        <div className="bg-slate-900/50 p-2 border-t border-slate-800 text-xs space-y-1 max-h-40 overflow-y-auto">
+                          {h.moves.map((m, idx) => (
+                            <div key={idx} className="flex justify-between px-2 text-slate-400">
+                              <span>{m.playerId === h.winnerId ? h.winnerName : (h.losers?.find(l => l.pid === m.playerId)?.name || h.loserName)}</span>
+                              <span className="font-mono">{m.points} {m.isBust && '(BUST)'} → {m.remaining}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                   {history.length === 0 && <div className="text-center p-4 text-slate-500 text-sm">Aucun historique</div>}
