@@ -105,6 +105,7 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [expandedHistory, setExpandedHistory] = useState(new Set());
+  const [victoryModal, setVictoryModal] = useState(null);
 
   // États pour le jeu
   const [gameState, setGameState] = useState({
@@ -343,6 +344,7 @@ export default function App() {
         });
       });
       alert(`Victoire de ${winner.name} ! (+${totalWinnerChange} Elo)`);
+      setVictoryModal({ winnerName: winner.name, eloChange: totalWinnerChange });
     } catch (e) {
       console.error("Transaction failed: ", e);
       alert("Erreur lors de l'enregistrement du match.");
@@ -604,6 +606,27 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-blue-500/30">
+      {/* Modale de victoire */}
+      {victoryModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-8 max-w-sm w-full text-center shadow-2xl relative overflow-hidden">
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-32 h-32 bg-blue-500/20 blur-3xl rounded-full pointer-events-none"></div>
+            <Trophy size={64} className="mx-auto text-yellow-500 mb-6 relative z-10 drop-shadow-[0_0_15px_rgba(234,179,8,0.5)]" />
+            <h2 className="text-3xl font-bold text-white mb-2 relative z-10">Victoire !</h2>
+            <div className="text-xl text-blue-400 font-bold mb-6 relative z-10">
+              {victoryModal.winnerName}
+            </div>
+            <div className="bg-slate-800/50 rounded-xl p-4 mb-8 border border-slate-700 relative z-10">
+              <div className="text-slate-400 text-sm uppercase tracking-wider font-bold mb-1">Gain Elo</div>
+              <div className="text-3xl font-mono font-bold text-green-400">+{victoryModal.eloChange}</div>
+            </div>
+            <Button onClick={() => setVictoryModal(null)} className="w-full py-4 text-lg relative z-10">
+              Continuer
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="max-w-2xl mx-auto min-h-screen flex flex-col">
         
         {/* Header */}
