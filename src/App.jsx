@@ -235,7 +235,7 @@ export default function App() {
 
     // Logique 501
     if (newScore === 0) {
-      winner = gameState.turn;
+      winner = currentPlayer.pid;
     } else if (newScore < 0 || newScore === 1) {
       // Bust
       isBust = true;
@@ -260,6 +260,7 @@ export default function App() {
     const updatedMoves = [...(gameState.moves || []), newMove];
 
     if (winner) {
+      if (window.confetti) window.confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 } });
       const loserIds = gameState.players.filter(p => p.pid !== winner).map(p => p.pid);
       await recordGame(winner, loserIds, updatedMoves);
       setGameState({ ...gameState, active: false });
