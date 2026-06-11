@@ -57,10 +57,10 @@ const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 // --- Constantes & Utilitaires ---
 const K_FACTOR = 32;
 
-const calculateElo = (ratingA, ratingB, actualScoreA) => {
-  // Formule logistique standard (Elo, 1978)
+// Calculate Elo with adjustable K factor (allows increasing impact for double-out games)
+const calculateElo = (ratingA, ratingB, actualScoreA, k = K_FACTOR) => {
   const expectedA = 1 / (1 + Math.pow(10, (ratingB - ratingA) / 400));
-  return Math.round(K_FACTOR * (actualScoreA - expectedA));
+  return Math.round(k * (actualScoreA - expectedA));
 };
 
 // --- Composants UI ---
@@ -201,11 +201,18 @@ export default function App() {
       console.error(e);
     }
   };
+  
 
-  const startGame = (selectedPlayerIds) => {
+  // startGame(selectedIds, { mode: '501'|'301', doubleOut: boolean })
+  const startGame = (selectedPlayerIds, options = {}) => {
+    // Backwards compatible: if options omitted, default to 501 without double-out
+    const mode = options.mode || '501';
+    const doubleOut = !!options.doubleOut;
+    const startingScore = mode === '301' ? 301 : 501;
+
     const gamePlayers = selectedPlayerIds.map(pid => {
       const p = players.find(pl => pl.pid === pid);
-      return { pid: p.pid, name: p.name, score: 501, elo: p.elo };
+      return { pid: p.pid, name: p.name, score: startingScore, elo: p.elo };
     });
 
     setGameState({
@@ -213,8 +220,11 @@ export default function App() {
       players: gamePlayers,
       turnIndex: 0,
       roundScore: '',
-      moves: []
+      moves: [],
+      mode,
+      doubleOut
     });
+
     setView('game');
   };
 
@@ -233,10 +243,23 @@ export default function App() {
     let finalScore = newScore;
     let winner = null;
     let isBust = false;
+    let confirmedDouble = false;
 
-    // Logique 501
+    // Logique de fin (501 ou 301 selon mode)
     if (newScore === 0) {
-      winner = currentPlayer.pid;
+      // If double-out rule active, ask the user to confirm the finishing dart was a double.
+      if (gameState.doubleOut) {
+        confirmedDouble = window.confirm("La finition doit être un double pour gagner. Confirmez que la finition était un double ?");
+        if (confirmedDouble) {
+          winner = currentPlayer.pid;
+        } else {
+          // Not a double -> bust
+          isBust = true;
+          finalScore = currentScore;
+        }
+      } else {
+        winner = currentPlayer.pid;
+      }
     } else if (newScore < 0 || newScore === 1) {
       // Bust
       isBust = true;
@@ -256,6 +279,7 @@ export default function App() {
       points: points,
       remaining: finalScore,
       isBust: isBust,
+      doubleFinish: confirmedDouble,
       timestamp: Date.now()
     };
     const updatedMoves = [...(gameState.moves || []), newMove];
@@ -263,7 +287,7 @@ export default function App() {
     if (winner) {
       if (window.confetti) window.confetti({ particleCount: 150, spread: 70, origin: { y: 0.6 } });
       const loserIds = gameState.players.filter(p => p.pid !== winner).map(p => p.pid);
-      await recordGame(winner, loserIds, updatedMoves);
+      await recordGame(winner, loserIds, updatedMoves, gameState.mode, confirmedDouble);
       setGameState({ ...gameState, active: false });
       setView('dashboard');
     } else {
@@ -277,23 +301,25 @@ export default function App() {
     }
   };
 
-  const recordGame = async (winnerId, loserIds, moves = []) => {
+  const recordGame = async (winnerId, loserIds, moves = [], mode = '501', doubleOut = false) => {
     const winner = players.find(p => p.pid === winnerId);
     const losers = loserIds.map(id => players.find(p => p.pid === id));
     
     if (!winner || losers.length === 0) return;
 
     // Calcul Elo Multijoueur (Winner takes all vs each loser)
+    // Si double-out activé, augmenter l'impact Elo via un multiplicateur K
+    const kMultiplier = doubleOut ? 1.5 : 1;
     let totalWinnerChange = 0;
     const loserUpdates = [];
 
     losers.forEach(loser => {
       // Le gagnant joue contre ce perdant
-      const change = calculateElo(winner.elo, loser.elo, 1);
+      const change = calculateElo(winner.elo, loser.elo, 1, K_FACTOR * kMultiplier);
       totalWinnerChange += change;
 
       // Le perdant joue contre le gagnant
-      const loserChange = calculateElo(loser.elo, winner.elo, 0);
+      const loserChange = calculateElo(loser.elo, winner.elo, 0, K_FACTOR * kMultiplier);
       loserUpdates.push({ 
         pid: loser.pid, 
         change: loserChange,
@@ -452,9 +478,89 @@ export default function App() {
               <Edit2 size={16} />
             </button>
           )}
+          {view === 'players' && (
+            <button onClick={() => handleDeletePlayer(p.pid)} className="text-red-500 hover:text-red-300">
+              <Trash2 size={16} />
+            </button>
+          )}
         </div>
       </div>
     );
+  };
+
+  const handleDeletePlayer = async (pid) => {
+    const pl = players.find(x => x.pid === pid);
+    if (!pl) return;
+
+    const remaining = players.filter(x => x.pid !== pid);
+    const baseline = 1200;
+    const pool = pl.elo - baseline; // redistribute the difference to baseline
+
+    if (remaining.length === 0) {
+      const ok = window.confirm(`Supprimer le joueur ${pl.name} [${pl.pid}] ? Il n'y a aucun joueur restant.`);
+      if (!ok) return;
+      try {
+        await runTransaction(db, async (transaction) => {
+          const delRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', pid);
+          transaction.delete(delRef);
+        });
+        alert(`${pl.name} supprimé.`);
+      } catch (e) {
+        console.error('Erreur suppression:', e);
+        alert('Erreur lors de la suppression du joueur.');
+      }
+      return;
+    }
+
+    const sorted = remaining.slice().sort((a, b) => b.elo - a.elo);
+    const maxElo = Math.max(...sorted.map(s => s.elo));
+    const minElo = Math.min(...sorted.map(s => s.elo));
+    const weights = sorted.map(s => pool >= 0 ? (maxElo - s.elo) + 1 : (s.elo - minElo) + 1);
+    const sumWeights = weights.reduce((a, b) => a + b, 0);
+    const desired = sorted.map((s, i) => Math.round(pool * (weights[i] / sumWeights)));
+    const deltaSum = desired.reduce((a, b) => a + b, 0);
+    const remainder = pool - deltaSum;
+    if (remainder !== 0) {
+      desired[desired.length - 1] += remainder;
+    }
+
+    const deltaMap = Object.fromEntries(sorted.map((s, i) => [s.pid, desired[i]]));
+    const preview = sorted.map((s) => {
+      const delta = deltaMap[s.pid];
+      return `${s.name} [${s.pid}]: ${s.elo} → ${s.elo + delta} (${delta >= 0 ? '+' : ''}${delta})`;
+    }).join('\n');
+
+    const actionLabel = pool === 0 ? 'aucun changement d’ELO' : `${pool >= 0 ? 'redistribution' : 'retrait'} de ${pool}`;
+    const ok = window.confirm(
+      `Supprimer le joueur ${pl.name} [${pl.pid}] ?\n${actionLabel}.\n\nPrévisualisation :\n${preview}`
+    );
+    if (!ok) return;
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const delRef = doc(db, 'artifacts', appId, 'public', 'data', 'players', pid);
+        transaction.delete(delRef);
+
+        if (pool !== 0) {
+          sorted.forEach((s) => {
+            const delta = deltaMap[s.pid];
+            if (delta === 0) return;
+            const ref = doc(db, 'artifacts', appId, 'public', 'data', 'players', s.pid);
+            transaction.update(ref, { elo: s.elo + delta });
+          });
+        }
+      });
+
+      setPlayers(prev => prev.filter(pp => pp.pid !== pid).map(pp => {
+        const delta = deltaMap[pp.pid] || 0;
+        return { ...pp, elo: pp.elo + delta };
+      }));
+
+      alert(`${pl.name} supprimé${pool !== 0 ? ' et redistribution appliquée.' : '.'}`);
+    } catch (e) {
+      console.error('Erreur suppression:', e);
+      alert('Erreur lors de la suppression du joueur.');
+    }
   };
 
   const GameView = () => {
@@ -557,6 +663,8 @@ export default function App() {
 
   const PreGameView = () => {
     const [selectedIds, setSelectedIds] = useState([]);
+    const [mode, setMode] = useState('501');
+    const [doubleOut, setDoubleOut] = useState(false);
 
     const togglePlayer = (pid) => {
       if (selectedIds.includes(pid)) {
@@ -568,8 +676,27 @@ export default function App() {
 
     return (
       <div className="space-y-6">
-        <h2 className="text-2xl font-bold text-white mb-6">Nouveau Match 501</h2>
-        
+        <h2 className="text-2xl font-bold text-white mb-6">Nouveau Match {mode}</h2>
+        <div className="grid grid-cols-2 gap-3">
+          <div className="bg-slate-900/50 p-3 rounded-xl border border-slate-800">
+            <label className="text-sm text-slate-400 font-bold mb-2 block">Mode de jeu</label>
+            <select value={mode} onChange={e => setMode(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white">
+              <option value="501">501</option>
+              <option value="301">301</option>
+            </select>
+          </div>
+
+          <div className="bg-slate-900/50 p-3 rounded-xl border border-slate-800 flex items-center justify-between">
+            <div>
+              <div className="text-sm text-slate-400 font-bold">Double-out</div>
+              <div className="text-xs text-slate-500">Finir par un double (impact Elo augmenté)</div>
+            </div>
+            <div>
+              <input id="doubleOut" type="checkbox" checked={doubleOut} onChange={e => setDoubleOut(e.target.checked)} className="h-5 w-5" />
+            </div>
+          </div>
+        </div>
+
         <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-800 max-h-96 overflow-y-auto">
           <div className="text-sm text-slate-400 mb-3 uppercase font-bold">Sélectionnez les joueurs ({selectedIds.length})</div>
           <div className="space-y-2">
@@ -593,7 +720,7 @@ export default function App() {
           variant="success" 
           className="w-full py-4 text-lg" 
           disabled={selectedIds.length < 2}
-          onClick={() => startGame(selectedIds)}
+          onClick={() => startGame(selectedIds, { mode, doubleOut })}
         >
           <Play size={20} fill="currentColor" /> Lancer le match
         </Button>
