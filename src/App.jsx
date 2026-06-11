@@ -491,6 +491,12 @@ export default function App() {
   const handleDeletePlayer = async (pid) => {
     const pl = players.find(x => x.pid === pid);
     if (!pl) return;
+    // Require password to delete a player
+    const pwd = window.prompt('Mot de passe requis pour supprimer un joueur :');
+    if (pwd !== '3083') {
+      alert('Mot de passe incorrect. Suppression annulée.');
+      return;
+    }
 
     const remaining = players.filter(x => x.pid !== pid);
     const baseline = 1200;
